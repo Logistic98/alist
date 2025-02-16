@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
@@ -16,7 +17,9 @@ import (
 type GoogleDrive struct {
 	model.Storage
 	Addition
-	AccessToken string
+	AccessToken            string
+	ServiceAccountFile     int
+	ServiceAccountFileList []string
 }
 
 func (d *GoogleDrive) Config() driver.Config {
@@ -24,14 +27,12 @@ func (d *GoogleDrive) Config() driver.Config {
 }
 
 func (d *GoogleDrive) GetAddition() driver.Additional {
-	return d.Addition
+	return &d.Addition
 }
 
-func (d *GoogleDrive) Init(ctx context.Context, storage model.Storage) error {
-	d.Storage = storage
-	err := utils.Json.UnmarshalFromString(d.Storage.Addition, &d.Addition)
-	if err != nil {
-		return err
+func (d *GoogleDrive) Init(ctx context.Context) error {
+	if d.ChunkSize == 0 {
+		d.ChunkSize = 5
 	}
 	return d.refreshToken()
 }
@@ -50,15 +51,14 @@ func (d *GoogleDrive) List(ctx context.Context, dir model.Obj, args model.ListAr
 	})
 }
 
-//func (d *GoogleDrive) Get(ctx context.Context, path string) (model.Obj, error) {
-//	// this is optional
-//	return nil, errs.NotImplement
-//}
-
 func (d *GoogleDrive) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
 	url := fmt.Sprintf("https://www.googleapis.com/drive/v3/files/%s?includeItemsFromAllDrives=true&supportsAllDrives=true", file.GetID())
+	_, err := d.request(url, http.MethodGet, nil, nil)
+	if err != nil {
+		return nil, err
+	}
 	link := model.Link{
-		URL: url + "&alt=media",
+		URL: url + "&alt=media&acknowledgeAbuse=true",
 		Header: http.Header{
 			"Authorization": []string{"Bearer " + d.AccessToken},
 		},
@@ -112,15 +112,36 @@ func (d *GoogleDrive) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *GoogleDrive) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
-	data := base.Json{
-		"name":    stream.GetName(),
-		"parents": []string{dstDir.GetID()},
+	obj := stream.GetExist()
+	var (
+		e    Error
+		url  string
+		data base.Json
+		res  *resty.Response
+		err  error
+	)
+	if obj != nil {
+		url = fmt.Sprintf("https://www.googleapis.com/upload/drive/v3/files/%s?uploadType=resumable&supportsAllDrives=true", obj.GetID())
+		data = base.Json{}
+	} else {
+		data = base.Json{
+			"name":    stream.GetName(),
+			"parents": []string{dstDir.GetID()},
+		}
+		url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true"
 	}
-	var e Error
-	url := "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true"
-	res, err := base.NoRedirectClient.R().SetHeader("Authorization", "Bearer "+d.AccessToken).
-		SetError(&e).SetBody(data).
-		Post(url)
+	req := base.NoRedirectClient.R().
+		SetHeaders(map[string]string{
+			"Authorization":           "Bearer " + d.AccessToken,
+			"X-Upload-Content-Type":   stream.GetMimetype(),
+			"X-Upload-Content-Length": strconv.FormatInt(stream.GetSize(), 10),
+		}).
+		SetError(&e).SetBody(data).SetContext(ctx)
+	if obj != nil {
+		res, err = req.Patch(url)
+	} else {
+		res, err = req.Post(url)
+	}
 	if err != nil {
 		return err
 	}
@@ -135,9 +156,14 @@ func (d *GoogleDrive) Put(ctx context.Context, dstDir model.Obj, stream model.Fi
 		return fmt.Errorf("%s: %v", e.Error.Message, e.Error.Errors)
 	}
 	putUrl := res.Header().Get("location")
-	_, err = d.request(putUrl, http.MethodPut, func(req *resty.Request) {
-		req.SetBody(stream.GetReadCloser())
-	}, nil)
+	if stream.GetSize() < d.ChunkSize*1024*1024 {
+		_, err = d.request(putUrl, http.MethodPut, func(req *resty.Request) {
+			req.SetHeader("Content-Length", strconv.FormatInt(stream.GetSize(), 10)).
+				SetBody(driver.NewLimitedUploadStream(ctx, stream))
+		}, nil)
+	} else {
+		err = d.chunkUpload(ctx, stream, putUrl)
+	}
 	return err
 }
 

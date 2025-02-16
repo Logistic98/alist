@@ -10,6 +10,7 @@ type Addition struct {
 	RefreshToken string `json:"refresh_token" required:"true"`
 	ClientID     string `json:"client_id" required:"true" default:"202264815644.apps.googleusercontent.com"`
 	ClientSecret string `json:"client_secret" required:"true" default:"X4Z3ca8xfWDb1Voo-F9a7ZxJ"`
+	ShowArchive  bool   `json:"show_archive"`
 }
 
 var config = driver.Config{
@@ -20,10 +21,8 @@ var config = driver.Config{
 	LocalSort:   true,
 }
 
-func New() driver.Driver {
-	return &GooglePhoto{}
-}
-
 func init() {
-	op.RegisterDriver(config, New)
+	op.RegisterDriver(func() driver.Driver {
+		return &GooglePhoto{}
+	})
 }

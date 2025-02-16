@@ -1,7 +1,10 @@
 package thunder
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"time"
@@ -14,6 +17,7 @@ import (
 const (
 	API_URL        = "https://api-pan.xunlei.com/drive/v1"
 	FILE_API_URL   = API_URL + "/files"
+	TASK_API_URL   = API_URL + "/tasks"
 	XLUSER_API_URL = "https://xluser-ssl.xunlei.com/v1"
 )
 
@@ -53,6 +57,9 @@ type Common struct {
 	UserAgent         string
 	DownloadUserAgent string
 	UseVideoUrl       bool
+
+	// 验证码token刷新成功回调
+	refreshCTokenCk func(token string)
 }
 
 func (c *Common) SetCaptchaToken(captchaToken string) {
@@ -94,7 +101,7 @@ func (c *Common) GetCaptchaSign() (timestamp, sign string) {
 	timestamp = fmt.Sprint(time.Now().UnixMilli())
 	str := fmt.Sprint(c.ClientID, c.ClientVersion, c.PackageName, c.DeviceID, timestamp)
 	for _, algorithm := range c.Algorithms {
-		str = utils.GetMD5Encode(str + algorithm)
+		str = utils.GetMD5EncodeStr(str + algorithm)
 	}
 	sign = "1." + str
 	return
@@ -125,13 +132,16 @@ func (c *Common) refreshCaptchaToken(action string, metas map[string]string) err
 	}
 
 	if resp.Url != "" {
-		return fmt.Errorf("need verify:%s", resp.Url)
+		return fmt.Errorf(`need verify: <a target="_blank" href="%s">Click Here</a>`, resp.Url)
 	}
 
 	if resp.CaptchaToken == "" {
 		return fmt.Errorf("empty captchaToken")
 	}
 
+	if c.refreshCTokenCk != nil {
+		c.refreshCTokenCk(resp.CaptchaToken)
+	}
 	c.SetCaptchaToken(resp.CaptchaToken)
 	return nil
 }
@@ -164,4 +174,30 @@ func (c *Common) Request(url, method string, callback base.ReqCallback, resp int
 	}
 
 	return res.Body(), nil
+}
+
+// 计算文件Gcid
+func getGcid(r io.Reader, size int64) (string, error) {
+	calcBlockSize := func(j int64) int64 {
+		var psize int64 = 0x40000
+		for float64(j)/float64(psize) > 0x200 && psize < 0x200000 {
+			psize = psize << 1
+		}
+		return psize
+	}
+
+	hash1 := sha1.New()
+	hash2 := sha1.New()
+	readSize := calcBlockSize(size)
+	for {
+		hash2.Reset()
+		if n, err := utils.CopyWithBufferN(hash2, r, readSize); err != nil && n == 0 {
+			if err != io.EOF {
+				return "", err
+			}
+			break
+		}
+		hash1.Write(hash2.Sum(nil))
+	}
+	return hex.EncodeToString(hash1.Sum(nil)), nil
 }

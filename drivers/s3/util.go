@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
+	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/request"
@@ -20,13 +22,21 @@ import (
 // do others that not defined in Driver interface
 
 func (d *S3) initSession() error {
+	var err error
+	accessKeyID, secretAccessKey, sessionToken := d.AccessKeyID, d.SecretAccessKey, d.SessionToken
+	if d.config.Name == "Doge" {
+		credentialsTmp, err := getCredentials(d.AccessKeyID, d.SecretAccessKey)
+		if err != nil {
+			return err
+		}
+		accessKeyID, secretAccessKey, sessionToken = credentialsTmp.AccessKeyId, credentialsTmp.SecretAccessKey, credentialsTmp.SessionToken
+	}
 	cfg := &aws.Config{
-		Credentials:      credentials.NewStaticCredentials(d.AccessKeyID, d.SecretAccessKey, ""),
+		Credentials:      credentials.NewStaticCredentials(accessKeyID, secretAccessKey, sessionToken),
 		Region:           &d.Region,
 		Endpoint:         &d.Endpoint,
 		S3ForcePathStyle: aws.Bool(d.ForcePathStyle),
 	}
-	var err error
 	d.Session, err = session.NewSession(cfg)
 	return err
 }
@@ -38,7 +48,14 @@ func (d *S3) getClient(link bool) *s3.S3 {
 			if r.HTTPRequest.Method != http.MethodGet {
 				return
 			}
-			r.HTTPRequest.URL.Host = d.CustomHost
+			//判断CustomHost是否以http://或https://开头
+			split := strings.SplitN(d.CustomHost, "://", 2)
+			if utils.SliceContains([]string{"http", "https"}, split[0]) {
+				r.HTTPRequest.URL.Scheme = split[0]
+				r.HTTPRequest.URL.Host = split[1]
+			} else {
+				r.HTTPRequest.URL.Host = d.CustomHost
+			}
 		})
 	}
 	return client
@@ -52,15 +69,16 @@ func getKey(path string, dir bool) string {
 	return path
 }
 
-// var defaultPlaceholderName = ".placeholder"
+var defaultPlaceholderName = ".alist"
+
 func getPlaceholderName(placeholder string) string {
-	//if placeholder == "" {
-	//	return defaultPlaceholderName
-	//}
+	if placeholder == "" {
+		return defaultPlaceholderName
+	}
 	return placeholder
 }
 
-func (d *S3) listV1(prefix string) ([]model.Obj, error) {
+func (d *S3) listV1(prefix string, args model.ListArgs) ([]model.Obj, error) {
 	prefix = getKey(prefix, true)
 	log.Debugf("list: %s", prefix)
 	files := make([]model.Obj, 0)
@@ -88,7 +106,7 @@ func (d *S3) listV1(prefix string) ([]model.Obj, error) {
 		}
 		for _, object := range listObjectsResult.Contents {
 			name := path.Base(*object.Key)
-			if name == getPlaceholderName(d.Placeholder) {
+			if !args.S3ShowPlaceholder && (name == getPlaceholderName(d.Placeholder) || name == d.Placeholder) {
 				continue
 			}
 			file := model.Object{
@@ -111,7 +129,7 @@ func (d *S3) listV1(prefix string) ([]model.Obj, error) {
 	return files, nil
 }
 
-func (d *S3) listV2(prefix string) ([]model.Obj, error) {
+func (d *S3) listV2(prefix string, args model.ListArgs) ([]model.Obj, error) {
 	prefix = getKey(prefix, true)
 	files := make([]model.Obj, 0)
 	var continuationToken, startAfter *string
@@ -139,8 +157,11 @@ func (d *S3) listV2(prefix string) ([]model.Obj, error) {
 			files = append(files, &file)
 		}
 		for _, object := range listObjectsResult.Contents {
+			if strings.HasSuffix(*object.Key, "/") {
+				continue
+			}
 			name := path.Base(*object.Key)
-			if name == getPlaceholderName(d.Placeholder) {
+			if !args.S3ShowPlaceholder && (name == getPlaceholderName(d.Placeholder) || name == d.Placeholder) {
 				continue
 			}
 			file := model.Object{
@@ -178,7 +199,7 @@ func (d *S3) copyFile(ctx context.Context, src string, dst string) error {
 	dstKey := getKey(dst, false)
 	input := &s3.CopyObjectInput{
 		Bucket:     &d.Bucket,
-		CopySource: aws.String("/" + d.Bucket + "/" + srcKey),
+		CopySource: aws.String(url.PathEscape("/" + d.Bucket + "/" + srcKey)),
 		Key:        &dstKey,
 	}
 	_, err := d.client.CopyObject(input)
@@ -186,7 +207,7 @@ func (d *S3) copyFile(ctx context.Context, src string, dst string) error {
 }
 
 func (d *S3) copyDir(ctx context.Context, src string, dst string) error {
-	objs, err := op.List(ctx, d, src, model.ListArgs{})
+	objs, err := op.List(ctx, d, src, model.ListArgs{S3ShowPlaceholder: true})
 	if err != nil {
 		return err
 	}
@@ -222,11 +243,12 @@ func (d *S3) removeDir(ctx context.Context, src string) error {
 		}
 	}
 	_ = d.removeFile(path.Join(src, getPlaceholderName(d.Placeholder)))
+	_ = d.removeFile(path.Join(src, d.Placeholder))
 	return nil
 }
 
 func (d *S3) removeFile(src string) error {
-	key := getKey(src, true)
+	key := getKey(src, false)
 	input := &s3.DeleteObjectInput{
 		Bucket: &d.Bucket,
 		Key:    &key,

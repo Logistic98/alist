@@ -11,19 +11,18 @@ type Addition struct {
 	Username string `json:"username" required:"true"`
 	Password string `json:"password" required:"true"`
 	driver.RootPath
+	TlsInsecureSkipVerify bool `json:"tls_insecure_skip_verify" default:"false"`
 }
 
 var config = driver.Config{
 	Name:        "WebDav",
 	LocalSort:   true,
-	OnlyLocal:   true,
+	OnlyProxy:   true,
 	DefaultRoot: "/",
 }
 
-func New() driver.Driver {
-	return &WebDav{}
-}
-
 func init() {
-	op.RegisterDriver(config, New)
+	op.RegisterDriver(func() driver.Driver {
+		return &WebDav{}
+	})
 }
